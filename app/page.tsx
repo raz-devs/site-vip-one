@@ -27,7 +27,7 @@ const money = new Intl.NumberFormat("en-AU", {
 
 function getSupabase(): SupabaseClient | null {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const key = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
   return url && key ? createClient(url, key) : null;
 }
 
@@ -37,6 +37,8 @@ export default function Home() {
   const [demo, setDemo] = useState(false);
   const [loading, setLoading] = useState(Boolean(supabase));
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [entries, setEntries] = useState<Entry[]>([]);
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -76,11 +78,19 @@ export default function Home() {
       setNotice("Demo mode is ready — use the button below.");
       return;
     }
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: { emailRedirectTo: window.location.origin },
-    });
-    setNotice(error ? error.message : "Check your inbox. Your sign-in link is on the way.");
+    setBusy(true);
+    setNotice("");
+    // One form for both: sign in, and if the account doesn't exist yet, create it.
+    const signIn = await supabase.auth.signInWithPassword({ email, password });
+    if (signIn.error?.code === "invalid_credentials") {
+      const signUp = await supabase.auth.signUp({ email, password });
+      if (signUp.error?.code === "user_already_exists") setNotice("Wrong password for that email.");
+      else if (signUp.error) setNotice(signUp.error.message);
+      else if (!signUp.data.session) setNotice("Check your inbox to confirm your email, then sign in.");
+    } else if (signIn.error) {
+      setNotice(signIn.error.message);
+    }
+    setBusy(false);
   }
 
   function enterDemo() {
@@ -91,28 +101,33 @@ export default function Home() {
   async function addJob(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const newEntry: Entry = {
-      id: crypto.randomUUID(),
-      customer: String(form.get("customer")),
-      job_name: String(form.get("job")),
+    const job = {
+      customer: String(form.get("customer")).trim(),
+      job_name: String(form.get("job")).trim(),
       amount: Number(form.get("price")),
-      direction: "in",
-      created_at: new Date().toISOString(),
+      direction: "in" as const,
     };
 
-    setEntries((current) => [newEntry, ...current]);
-    setSheetOpen(false);
-
-    if (user && supabase) {
-      const { error } = await supabase.from("money_entries").insert({
-        user_id: user.id,
-        customer: newEntry.customer,
-        job_name: newEntry.job_name,
-        amount: newEntry.amount,
-        direction: "in",
-      });
-      if (error) setNotice("Saved here, but could not sync. Try again later.");
+    if (!user || !supabase) {
+      setEntries((current) => [{ ...job, id: crypto.randomUUID(), created_at: new Date().toISOString() }, ...current]);
+      setSheetOpen(false);
+      return;
     }
+
+    setBusy(true);
+    setNotice("");
+    const { data, error } = await supabase
+      .from("money_entries")
+      .insert({ ...job, user_id: user.id })
+      .select("id, customer, job_name, amount, direction, created_at")
+      .single();
+    setBusy(false);
+    if (error) {
+      setNotice(`Couldn't save that job: ${error.message}`);
+      return;
+    }
+    setEntries((current) => [data as Entry, ...current]);
+    setSheetOpen(false);
   }
 
   async function signOut() {
@@ -120,15 +135,16 @@ export default function Home() {
     setUser(null);
     setDemo(false);
     setEntries([]);
+    setNotice("");
   }
 
   if (loading) return <main className="loading">Loading your month…</main>;
-  if (!user && !demo) return <Login email={email} setEmail={setEmail} notice={notice} onSubmit={sendLogin} onDemo={enterDemo} />;
+  if (!user && !demo) return <Login email={email} setEmail={setEmail} password={password} setPassword={setPassword} busy={busy} notice={notice} onSubmit={sendLogin} onDemo={enterDemo} />;
 
   const income = entries.filter((item) => item.direction === "in").reduce((sum, item) => sum + Number(item.amount), 0);
   const outgoing = entries.filter((item) => item.direction === "out").reduce((sum, item) => sum + Number(item.amount), 0);
   const profit = income - outgoing;
-  const latestJob = entries.find((item) => item.direction === "in");
+  const jobs = entries.filter((item) => item.direction === "in");
   const firstName = user?.email?.split("@")[0].split(/[._-]/)[0] || "Jack";
   const month = new Intl.DateTimeFormat("en-AU", { month: "long", year: "numeric" }).format(new Date());
 
@@ -160,7 +176,7 @@ export default function Home() {
               <span>Profit</span>
               <strong>{money.format(profit)}</strong>
             </div>
-            <span className="trend">↗</span>
+            <span className="trend">{profit >= 0 ? "↗" : "↘"}</span>
           </div>
           <div className="totals">
             <div><span>Money in</span><b>{money.format(income)}</b></div>
@@ -175,13 +191,15 @@ export default function Home() {
         </button>
 
         <section className="latest">
-          <div className="section-title"><h2>Latest money in</h2><span>This month</span></div>
-          {latestJob ? (
-            <div className="job-row">
-              <span className="job-mark">✓</span>
-              <div><b>{latestJob.customer}</b><small>{latestJob.job_name}</small></div>
-              <strong>+{money.format(latestJob.amount)}</strong>
-            </div>
+          <div className="section-title"><h2>Jobs done</h2><span>{jobs.length} this month</span></div>
+          {jobs.length ? (
+            jobs.map((job) => (
+              <div className="job-row" key={job.id}>
+                <span className="job-mark">✓</span>
+                <div><b>{job.customer}</b><small>{job.job_name}</small></div>
+                <strong>+{money.format(job.amount)}</strong>
+              </div>
+            ))
           ) : (
             <p className="empty">No jobs added yet. Make the first one count.</p>
           )}
@@ -200,7 +218,8 @@ export default function Home() {
               <label>Customer<input name="customer" placeholder="e.g. Sarah Wilson" autoFocus required /></label>
               <label>What was the job?<input name="job" placeholder="e.g. Hot water install" required /></label>
               <label>Price<div className="price-input"><span>$</span><input name="price" type="number" inputMode="decimal" min="1" step="0.01" placeholder="0" required /></div></label>
-              <button className="save-button" type="submit">Add money in <span>→</span></button>
+              <button className="save-button" type="submit" disabled={busy}>{busy ? "Saving…" : "Add money in"} <span>→</span></button>
+              {notice && <p className="notice error">{notice}</p>}
             </form>
           </section>
         </div>
@@ -209,9 +228,12 @@ export default function Home() {
   );
 }
 
-function Login({ email, setEmail, notice, onSubmit, onDemo }: {
+function Login({ email, setEmail, password, setPassword, busy, notice, onSubmit, onDemo }: {
   email: string;
   setEmail: (value: string) => void;
+  password: string;
+  setPassword: (value: string) => void;
+  busy: boolean;
   notice: string;
   onSubmit: (event: FormEvent) => void;
   onDemo: () => void;
@@ -226,8 +248,10 @@ function Login({ email, setEmail, notice, onSubmit, onDemo }: {
           <p>Money in, money out, and what&apos;s left. Nothing else in the way.</p>
         </div>
         <form onSubmit={onSubmit} className="login-form">
-          <label>Work email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@yourbusiness.com.au" required /></label>
-          <button type="submit">Continue <span>→</span></button>
+          <label>Work email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@yourbusiness.com.au" autoComplete="email" required /></label>
+          <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="6+ characters" autoComplete="current-password" minLength={6} required /></label>
+          <button type="submit" disabled={busy}>{busy ? "Signing in…" : "Sign in"} <span>→</span></button>
+          <small className="hint">New here? Same form — we&apos;ll set you up.</small>
         </form>
         {notice && <p className="notice">{notice}</p>}
         <button className="demo-button" onClick={onDemo}>View demo workspace</button>
